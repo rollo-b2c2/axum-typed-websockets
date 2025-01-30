@@ -112,7 +112,7 @@
 #![cfg_attr(test, allow(clippy::float_cmp))]
 
 use axum::{
-    async_trait,
+    body::Bytes,
     extract::{ws, FromRequestParts},
     http::request::Parts,
     response::IntoResponse,
@@ -172,7 +172,6 @@ with_and_without_json! {
     }
 }
 
-#[async_trait]
 impl<S, R, C, B> FromRequestParts<B> for WebSocketUpgrade<S, R, C>
 where
     B: Send + Sync,
@@ -180,7 +179,8 @@ where
     type Rejection = <ws::WebSocketUpgrade as FromRequestParts<B>>::Rejection;
 
     async fn from_request_parts(parts: &mut Parts, state: &B) -> Result<Self, Self::Rejection> {
-        let upgrade = FromRequestParts::from_request_parts(parts, state).await?;
+        let upgrade =
+            <ws::WebSocketUpgrade as FromRequestParts<_>>::from_request_parts(parts, state).await?;
         Ok(Self {
             upgrade,
             _marker: PhantomData,
@@ -192,7 +192,7 @@ impl<S, R, C> WebSocketUpgrade<S, R, C> {
     /// Finalize upgrading the connection and call the provided callback with
     /// the stream.
     ///
-    /// This is analagous to [`axum::extract::ws::WebSocketUpgrade::on_upgrade`].
+    /// This is analogous to [`axum::extract::ws::WebSocketUpgrade::on_upgrade`].
     pub fn on_upgrade<F, Fut>(self, callback: F) -> impl IntoResponse
     where
         F: FnOnce(WebSocket<S, R, C>) -> Fut + Send + 'static,
@@ -250,7 +250,7 @@ impl<S, R, C> WebSocket<S, R, C> {
     ///
     /// Returns `None` if the stream stream has closed.
     ///
-    /// This is analagous to [`axum::extract::ws::WebSocket::recv`] but with a
+    /// This is analogous to [`axum::extract::ws::WebSocket::recv`] but with a
     /// statically typed message.
     pub async fn recv(&mut self) -> Option<Result<Message<R>, Error<C::Error>>>
     where
@@ -262,7 +262,7 @@ impl<S, R, C> WebSocket<S, R, C> {
 
     /// Send a message.
     ///
-    /// This is analagous to [`axum::extract::ws::WebSocket::send`] but with a
+    /// This is analogous to [`axum::extract::ws::WebSocket::send`] but with a
     /// statically typed message.
     pub async fn send(&mut self, msg: Message<S>) -> Result<(), Error<C::Error>>
     where
@@ -274,8 +274,8 @@ impl<S, R, C> WebSocket<S, R, C> {
 
     /// Gracefully close this WebSocket.
     ///
-    /// This is analagous to [`axum::extract::ws::WebSocket::close`].
-    pub async fn close(self) -> Result<(), Error<C::Error>>
+    /// This is analogous to [`axum::extract::ws::WebSocket::close`].
+    pub async fn close(mut self) -> Result<(), Error<C::Error>>
     where
         C: Codec,
     {
@@ -310,7 +310,7 @@ where
 
         if let Some(msg) = msg {
             let msg = match msg {
-                ws::Message::Text(msg) => msg.into_bytes(),
+                ws::Message::Text(msg) => msg.into(),
                 ws::Message::Binary(bytes) => bytes,
                 ws::Message::Close(frame) => {
                     return Poll::Ready(Some(Ok(Message::Close(frame))));
@@ -373,12 +373,12 @@ pub trait Codec {
     type Error;
 
     /// Encode a message.
-    fn encode<S>(msg: S) -> Result<Vec<u8>, Self::Error>
+    fn encode<S>(msg: S) -> Result<Bytes, Self::Error>
     where
         S: Serialize;
 
     /// Decode a message.
-    fn decode<R>(buf: Vec<u8>) -> Result<R, Self::Error>
+    fn decode<R>(buf: Bytes) -> Result<R, Self::Error>
     where
         R: DeserializeOwned;
 }
@@ -395,14 +395,14 @@ pub struct JsonCodec;
 impl Codec for JsonCodec {
     type Error = serde_json::Error;
 
-    fn encode<S>(msg: S) -> Result<Vec<u8>, Self::Error>
+    fn encode<S>(msg: S) -> Result<Bytes, Self::Error>
     where
         S: Serialize,
     {
-        serde_json::to_vec(&msg)
+        serde_json::to_vec(&msg).map(|buf| buf.into())
     }
 
-    fn decode<R>(buf: Vec<u8>) -> Result<R, Self::Error>
+    fn decode<R>(buf: Bytes) -> Result<R, Self::Error>
     where
         R: DeserializeOwned,
     {
@@ -451,11 +451,11 @@ pub enum Message<T> {
     /// A ping message with the specified payload
     ///
     /// The payload here must have a length less than 125 bytes
-    Ping(Vec<u8>),
+    Ping(Bytes),
     /// A pong message with the specified payload
     ///
     /// The payload here must have a length less than 125 bytes
-    Pong(Vec<u8>),
+    Pong(Bytes),
     /// A close message with the optional close frame.
-    Close(Option<ws::CloseFrame<'static>>),
+    Close(Option<ws::CloseFrame>),
 }
