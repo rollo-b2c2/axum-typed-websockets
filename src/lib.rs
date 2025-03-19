@@ -68,8 +68,10 @@
 //!
 //! The following features are available:
 //!
-//! - `json`: Enables [`JsonCodec`] which encodes message as JSON using
+//! - `json`: Enables [`TextJsonCodec`] and [`BinaryJsonCodec`] which encodes message as JSON using
 //! `serde_json`. Enabled by default.
+//! - `msgpack`: Enables [`MsgPackCodec`] which encodes message as MessagePack using
+//! `rmp-serde`.
 
 #![warn(
     clippy::all,
@@ -118,7 +120,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Serialize, Deserialize};
 use std::{
     error::Error as StdError,
     fmt,
@@ -132,7 +134,7 @@ use std::{
 macro_rules! with_and_without_json {
     (
         $(#[$m:meta])*
-        pub struct $name:ident<S, R, C = JsonCodec> {
+        pub struct $name:ident<S, R, C = TextJsonCodec> {
             $(
                 $ident:ident : $ty:ty,
             )*
@@ -140,7 +142,7 @@ macro_rules! with_and_without_json {
     ) => {
         $(#[$m])*
         #[cfg(feature = "json")]
-        pub struct $name<S, R, C = JsonCodec> {
+        pub struct $name<S, R, C = TextJsonCodec> {
             $(
                 $ident : $ty,
             )*
@@ -166,7 +168,7 @@ with_and_without_json! {
     /// - `R` - The message sent from the client to the server.
     /// - `C` - The [`Codec`] used to encode and decode messages. Defaults to
     /// [`JsonCodec`] which serializes messages with `serde_json`.
-    pub struct WebSocketUpgrade<S, R, C = JsonCodec> {
+    pub struct WebSocketUpgrade<S, R, C = TextJsonCodec> {
         upgrade: ws::WebSocketUpgrade,
         _marker: PhantomData<fn() -> (S, R, C)>,
     }
@@ -239,7 +241,7 @@ impl<S, R, C> fmt::Debug for WebSocketUpgrade<S, R, C> {
 with_and_without_json! {
     /// A version of [`axum::extract::ws::WebSocket`] with type safe
     /// messages.
-    pub struct WebSocket<S, R, C = JsonCodec> {
+    pub struct WebSocket<S, R, C = TextJsonCodec> {
         socket: ws::WebSocket,
         _marker: PhantomData<fn() -> (S, R, C)>,
     }
@@ -252,7 +254,7 @@ impl<S, R, C> WebSocket<S, R, C> {
     ///
     /// This is analogous to [`axum::extract::ws::WebSocket::recv`] but with a
     /// statically typed message.
-    pub async fn recv(&mut self) -> Option<Result<Message<R>, Error<C::Error>>>
+    pub async fn recv(&mut self) -> Option<Result<Message<R>, Error<C::DecodeError>>>
     where
         R: DeserializeOwned,
         C: Codec,
@@ -264,7 +266,7 @@ impl<S, R, C> WebSocket<S, R, C> {
     ///
     /// This is analogous to [`axum::extract::ws::WebSocket::send`] but with a
     /// statically typed message.
-    pub async fn send(&mut self, msg: Message<S>) -> Result<(), Error<C::Error>>
+    pub async fn send(&mut self, msg: Message<S>) -> Result<(), Error<C::EncodeError>>
     where
         S: Serialize,
         C: Codec,
@@ -274,8 +276,8 @@ impl<S, R, C> WebSocket<S, R, C> {
 
     /// Gracefully close this WebSocket.
     ///
-    /// This is analogous to [`axum::extract::ws::WebSocket::close`].
-    pub async fn close(mut self) -> Result<(), Error<C::Error>>
+    /// This is analagous to [`axum::extract::ws::WebSocket::close`].
+    pub async fn close(mut self) -> Result<(), Error<()>>
     where
         C: Codec,
     {
@@ -301,7 +303,7 @@ where
     R: DeserializeOwned,
     C: Codec,
 {
-    type Item = Result<Message<R>, Error<C::Error>>;
+    type Item = Result<Message<R>, Error<C::DecodeError>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let msg = futures_util::ready!(Pin::new(&mut self.socket)
@@ -310,8 +312,8 @@ where
 
         if let Some(msg) = msg {
             let msg = match msg {
-                ws::Message::Text(msg) => msg.into(),
-                ws::Message::Binary(bytes) => bytes,
+                ws::Message::Text(msg) => TextOrBinary::Text(msg.to_string()),
+                ws::Message::Binary(bytes) => TextOrBinary::Binary(bytes.into()),
                 ws::Message::Close(frame) => {
                     return Poll::Ready(Some(Ok(Message::Close(frame))));
                 }
@@ -336,7 +338,7 @@ where
     S: Serialize,
     C: Codec,
 {
-    type Error = Error<C::Error>;
+    type Error = Error<C::EncodeError>;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.socket).poll_ready(cx).map_err(Error::Ws)
@@ -344,7 +346,7 @@ where
 
     fn start_send(mut self: Pin<&mut Self>, msg: Message<S>) -> Result<(), Self::Error> {
         let msg = match msg {
-            Message::Item(buf) => ws::Message::Binary(C::encode(buf).map_err(Error::Codec)?),
+            Message::Item(buf) => C::encode(buf).map_err(Error::Codec)?.into(),
             Message::Ping(buf) => ws::Message::Ping(buf),
             Message::Pong(buf) => ws::Message::Pong(buf),
             Message::Close(frame) => ws::Message::Close(frame),
@@ -364,49 +366,137 @@ where
     }
 }
 
+/// Specifies if the message should be encoded/decoded as text or binary for transmission over the wire
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TextOrBinary {
+    /// Message should be transmitted as text
+    Text(String),
+    /// Message should be transmitted as Binary
+    Binary(Vec<u8>),
+}
+
+impl From<TextOrBinary> for ws::Message {
+    fn from(value: TextOrBinary) -> Self {
+        match value {
+            TextOrBinary::Text(txt) => ws::Message::Text(txt.into()),
+            TextOrBinary::Binary(bin) => ws::Message::Binary(bin.into()),
+        }
+    }
+}
+
 /// Trait for encoding and decoding WebSocket messages.
 ///
 /// This allows you to customize how messages are encoded when sent over the
 /// wire.
 pub trait Codec {
-    /// The errors that can happen when using this codec.
-    type Error;
+    /// The errors that can happen when encoding using this codec.
+    type EncodeError;
+    /// The errors that can happen when decoding using this codec.
+    type DecodeError;
 
     /// Encode a message.
-    fn encode<S>(msg: S) -> Result<Bytes, Self::Error>
+    fn encode<S>(msg: S) -> Result<TextOrBinary, Self::EncodeError>
     where
         S: Serialize;
 
     /// Decode a message.
-    fn decode<R>(buf: Bytes) -> Result<R, Self::Error>
+    fn decode<R>(msg: TextOrBinary) -> Result<R, Self::DecodeError>
     where
         R: DeserializeOwned;
 }
 
-/// A [`Codec`] that serializes messages as JSON using `serde_json`.
+/// A [`Codec`] that serializes messages as JSON using `serde_json` and transmits it as text.
+/// Note that receiving messages works as both binary or text
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct JsonCodec;
+pub struct TextJsonCodec;
 
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-impl Codec for JsonCodec {
-    type Error = serde_json::Error;
+impl Codec for TextJsonCodec {
+    type EncodeError = serde_json::Error;
+    type DecodeError = serde_json::Error;
 
-    fn encode<S>(msg: S) -> Result<Bytes, Self::Error>
+    fn encode<S>(msg: S) -> Result<TextOrBinary, Self::EncodeError>
     where
         S: Serialize,
     {
-        serde_json::to_vec(&msg).map(|buf| buf.into())
+        serde_json::to_string(&msg).map(TextOrBinary::Text)
     }
 
-    fn decode<R>(buf: Bytes) -> Result<R, Self::Error>
+    fn decode<R>(msg: TextOrBinary) -> Result<R, Self::DecodeError>
     where
         R: DeserializeOwned,
     {
-        serde_json::from_slice(&buf)
+        match msg {
+            TextOrBinary::Text(txt) => serde_json::from_str(&txt),
+            TextOrBinary::Binary(bin) => serde_json::from_slice(&bin),
+        }
+    }
+}
+
+/// A [`Codec`] that serializes messages as JSON using `serde_json` and transmits it as binary.
+/// Note that receiving messages works as both binary or text
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct BinaryJsonCodec;
+
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+impl Codec for BinaryJsonCodec {
+    type EncodeError = serde_json::Error;
+    type DecodeError = serde_json::Error;
+
+    fn encode<S>(msg: S) -> Result<TextOrBinary, Self::EncodeError>
+    where
+        S: Serialize,
+    {
+        serde_json::to_vec(&msg).map(|vec| TextOrBinary::Binary(vec.into()))
+    }
+
+    fn decode<R>(msg: TextOrBinary) -> Result<R, Self::DecodeError>
+    where
+        R: DeserializeOwned,
+    {
+        match msg {
+            TextOrBinary::Text(txt) => serde_json::from_str(&txt),
+            TextOrBinary::Binary(bin) => serde_json::from_slice(&bin),
+        }
+    }
+}
+
+/// A [`Codec`] that serializes messages as MessagePack using `rmp_serde` and transmits it as binary.
+#[cfg(feature = "msgpack")]
+#[cfg_attr(docsrs, doc(cfg(feature = "msgpack")))]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct MsgPackCodec;
+
+#[cfg(feature = "msgpack")]
+#[cfg_attr(docsrs, doc(cfg(feature = "msgpack")))]
+impl Codec for MsgPackCodec {
+    type EncodeError = rmp_serde::encode::Error;
+    type DecodeError = rmp_serde::decode::Error;
+
+    fn encode<S>(msg: S) -> Result<TextOrBinary, Self::EncodeError>
+    where
+        S: Serialize,
+    {
+        rmp_serde::encode::to_vec(&msg).map(TextOrBinary::Binary)
+    }
+
+    fn decode<R>(msg: TextOrBinary) -> Result<R, Self::DecodeError>
+    where
+        R: DeserializeOwned,
+    {
+        match msg {
+            TextOrBinary::Text(txt) => rmp_serde::decode::from_slice(txt.as_bytes()),
+            TextOrBinary::Binary(bin) => rmp_serde::decode::from_slice(&bin),
+        }
     }
 }
 
